@@ -1,0 +1,216 @@
+---
+# Scaleway VM-adapter — implementation of the WebRobot vm-adapter contract.
+#
+# Contract: see docs/CLOUD_PROVIDER_PARTNER_ADAPTER.md "Contratto" and
+# docs/CLOUD_ADAPTER_HOT_EXTENSIBILITY.md §5 in webrobot-project.
+#
+# Inputs (set by the dispatcher playbook scale_customer_vm_agents.yml):
+#   vm_action          create | delete | list | health
+#   vm_api_token       Scaleway secret key (X-Auth-Token header)
+#   vm_server_name     name to create / delete (single-VM ops)
+#   vm_server_type     commercial type (DEV1-S, GP1-S, …)
+#   vm_image           image label OR uuid (default: ubuntu_jammy)
+#   vm_region          zone (e.g. fr-par-1)
+#   vm_ssh_key_refs    list of SSH-key UUIDs registered on the project
+#   vm_label_selector  e.g. "customer-id=tenant-42" — translated to Scaleway tag
+#   scw_project_id     Scaleway project UUID (pulled from env if not provided)
+#
+# Outputs (set_fact'd):
+#   vm_server_id       provider VM uuid
+#   vm_server_ip       reachable IPv4 (public) or IPv6
+#   vm_server_status   running | stopping | stopped
+#   vm_health_status   ok | fail   (only for action=health)
+#   vm_fleet           list of dicts compatible with the dispatcher schema
+#                      ({ name, id, created, public_ip, status })
+#   hcloud_scale_new_metadata    dispatcher-compat hand-off list when action=create
+
+- name: "[scaleway] Validate inputs"
+  ansible.builtin.assert:
+    that:
+      - vm_action is defined
+      - vm_action in ['create', 'delete', 'list', 'health']
+      - vm_api_token is defined
+      - vm_api_token | length > 0
+    fail_msg: >-
+      scaleway_adapter: vm_action (create|delete|list|health) and vm_api_token are required.
+
+- name: "[scaleway] Resolve common variables"
+  ansible.builtin.set_fact:
+    scw_api_url: "{{ scw_api_url | default('https://api.scaleway.com/instance/v1') }}"
+    scw_zone: "{{ vm_region | default('fr-par-1') }}"
+    scw_project_id_effective: >-
+      {{
+        scw_project_id
+        | default(lookup('env', 'SCW_DEFAULT_PROJECT_ID'), true)
+        | default('', true)
+      }}
+
+- name: "[scaleway] Customer tag (label_selector → Scaleway tag)"
+  ansible.builtin.set_fact:
+    scw_customer_tag: >-
+      {{ vm_label_selector | default('') | regex_replace('^customer-id=', 'customer-id=') }}
+
+# ── HEALTH ────────────────────────────────────────────────────────────────────
+- name: "[scaleway] Health smoke test"
+  when: vm_action == 'health'
+  block:
+    - name: "[scaleway] Probe Scaleway Instance API"
+      ansible.builtin.uri:
+        url: "{{ scw_api_url }}/zones/{{ scw_zone }}/servers?per_page=1"
+        headers:
+          X-Auth-Token: "{{ vm_api_token }}"
+          Accept: application/json
+        return_content: false
+        status_code: [200, 401, 403]
+      register: scw_health_probe
+    - name: "[scaleway] Health result"
+      ansible.builtin.set_fact:
+        vm_health_status: "{{ 'ok' if (scw_health_probe.status | default(0)) == 200 else 'fail' }}"
+
+# ── LIST ──────────────────────────────────────────────────────────────────────
+- name: "[scaleway] List servers in zone (paginate up to 100)"
+  when: vm_action == 'list'
+  block:
+    - name: "[scaleway] GET /servers"
+      ansible.builtin.uri:
+        url: >-
+          {{ scw_api_url }}/zones/{{ scw_zone }}/servers
+          ?per_page=100
+          {% if scw_customer_tag | length > 0 %}&tags={{ scw_customer_tag | urlencode }}{% endif %}
+        headers:
+          X-Auth-Token: "{{ vm_api_token }}"
+          Accept: application/json
+        return_content: true
+        status_code: [200]
+      register: scw_list_servers
+    - name: "[scaleway] Map fleet to dispatcher-compat schema"
+      ansible.builtin.set_fact:
+        vm_fleet: >-
+          {{
+            (scw_list_servers.json.servers | default([]))
+            | map('to_json') | map('from_json')
+            | map('combine', {})
+            | list
+            | json_query('[*].{name: name, id: id, created: creation_date, status: state, public_ip: public_ip.address}')
+          }}
+
+# ── CREATE ────────────────────────────────────────────────────────────────────
+- name: "[scaleway] Create VM"
+  when: vm_action == 'create'
+  block:
+    - name: "[scaleway] Project id required"
+      ansible.builtin.assert:
+        that:
+          - scw_project_id_effective is defined
+          - scw_project_id_effective | length > 0
+        fail_msg: >-
+          scaleway_adapter: scw_project_id (or SCW_DEFAULT_PROJECT_ID env) is required for create.
+
+    - name: "[scaleway] POST /servers"
+      ansible.builtin.uri:
+        url: "{{ scw_api_url }}/zones/{{ scw_zone }}/servers"
+        method: POST
+        headers:
+          X-Auth-Token: "{{ vm_api_token }}"
+          Content-Type: application/json
+          Accept: application/json
+        body_format: json
+        body:
+          name: "{{ vm_server_name }}"
+          commercial_type: "{{ vm_server_type | default('DEV1-S') }}"
+          image: "{{ vm_image | default('ubuntu_jammy') }}"
+          project: "{{ scw_project_id_effective }}"
+          tags: >-
+            {{
+              ([scw_customer_tag] if (scw_customer_tag | length > 0) else [])
+              + (vm_extra_tags | default([]))
+            }}
+          dynamic_ip_required: true
+        status_code: [201]
+      register: scw_create
+
+    - name: "[scaleway] Power on the VM"
+      ansible.builtin.uri:
+        url: "{{ scw_api_url }}/zones/{{ scw_zone }}/servers/{{ scw_create.json.server.id }}/action"
+        method: POST
+        headers:
+          X-Auth-Token: "{{ vm_api_token }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          action: poweron
+        status_code: [202]
+
+    - name: "[scaleway] Poll for IPv4 (Scaleway assigns it asynchronously)"
+      ansible.builtin.uri:
+        url: "{{ scw_api_url }}/zones/{{ scw_zone }}/servers/{{ scw_create.json.server.id }}"
+        headers:
+          X-Auth-Token: "{{ vm_api_token }}"
+        return_content: true
+      register: scw_poll
+      retries: 30
+      delay: 5
+      until: >-
+        (scw_poll.json.server.public_ip.address | default('')) | length > 0
+
+    - name: "[scaleway] Expose outputs"
+      ansible.builtin.set_fact:
+        vm_server_id: "{{ scw_poll.json.server.id }}"
+        vm_server_ip: "{{ scw_poll.json.server.public_ip.address | default('') }}"
+        vm_server_status: "{{ scw_poll.json.server.state | default('unknown') }}"
+
+    # Hand-off into the existing mesh+k3s phase. The dispatcher reads
+    # `hcloud_scale_new_metadata` (legacy name kept for compat) — schema
+    # is { name, id, ipv4, ipv6 }. Subsequent tasks are provider-agnostic.
+    - name: "[scaleway] Append to hand-off list"
+      ansible.builtin.set_fact:
+        hcloud_scale_new_metadata: >-
+          {{
+            (hcloud_scale_new_metadata | default([])) + [{
+              'name': scw_poll.json.server.name,
+              'id': scw_poll.json.server.id,
+              'ipv4': (scw_poll.json.server.public_ip.address | default('')),
+              'ipv6': (scw_poll.json.server.ipv6.address | default(''))
+            }]
+          }}
+
+# ── DELETE ────────────────────────────────────────────────────────────────────
+- name: "[scaleway] Delete VM"
+  when: vm_action == 'delete'
+  block:
+    - name: "[scaleway] Find server by name (Scaleway has no by-name endpoint)"
+      ansible.builtin.uri:
+        url: "{{ scw_api_url }}/zones/{{ scw_zone }}/servers?name={{ vm_server_name | urlencode }}&per_page=10"
+        headers:
+          X-Auth-Token: "{{ vm_api_token }}"
+        return_content: true
+        status_code: [200]
+      register: scw_lookup
+
+    - name: "[scaleway] Resolve unique target server id"
+      ansible.builtin.set_fact:
+        scw_target_id: >-
+          {{
+            (scw_lookup.json.servers | default([]))
+            | selectattr('name', 'equalto', vm_server_name)
+            | map(attribute='id')
+            | first | default('')
+          }}
+
+    - name: "[scaleway] No-op if server already gone"
+      when: scw_target_id | length == 0
+      ansible.builtin.debug:
+        msg: "[scaleway] No server matches name '{{ vm_server_name }}' — nothing to delete."
+
+    - name: "[scaleway] Power-off the server (best-effort)"
+      when: scw_target_id | length > 0
+      ansible.builtin.uri:
+        url: "{{ scw_api_url }}/zones/{{ scw_zone }}/servers/{{ scw_target_id }}/action"
+        method: POST
+        headers:
+          X-Auth-Token: "{{ vm_api_token }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          action: terminate
+        status_code: [200, 202, 400]

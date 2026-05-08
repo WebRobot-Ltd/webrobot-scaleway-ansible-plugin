@@ -1,0 +1,16 @@
+---
+galaxy_info:
+  role_name: scaleway_adapter
+  author: WebRobot
+  description: >-
+    Scaleway VM-adapter implementing the WebRobot vm-adapter contract
+    (vm_action create|delete|list|health). Hot-loaded into Ansible Job pods
+    by the platform's vm-adapter-loader init container. Distributed via the
+    WebRobot marketplace as a tech-partner bundle.
+  license: Apache-2.0
+  min_ansible_version: "2.13"
+  platforms:
+    - name: GenericLinux
+      versions: [all]
+
+dependencies: []

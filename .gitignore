@@ -1,0 +1,9 @@
+dist/
+*.zip
+.DS_Store
+*.swp
+*.bak
+.vscode/
+.idea/
+__pycache__/
+*.retry
