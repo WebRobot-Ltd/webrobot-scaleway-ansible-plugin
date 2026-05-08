@@ -112,20 +112,35 @@ where `<ansibleRole>` matches `manifest.components[0].ansibleRole`. If
 you ship multiple adapters in one bundle (e.g. `scaleway` + `vultr`),
 list both as separate `components[]` and ship one role dir per adapter.
 
-## Pricing & metering
+## Pricing & metering — v1 BYOC model
 
-The platform supports four pricing models on the bundle level
-(`price_unit` field on `tech_partner_bundles`):
+> **v1 (current): Bring Your Own Cloud.** The WebRobot customer pays
+> Scaleway **directly** on their own Scaleway account via the Scaleway
+> billing portal. WebRobot does **not** meter VM uptime and does not
+> route money to the cloud_provider partner for Spark VM consumption.
+> Set `price_unit: free` on the bundle for v1.
+>
+> The `cloud_provider` partner role exists in the WebRobot marketplace
+> for **discoverability + future reselling** (Phase 2). The Stripe
+> Connect onboarding remains optional; it'll be activated when the
+> reselling pipeline goes live.
+
+### Phase 2 (reselling — deferred)
+
+Once WebRobot enables reselling, the platform will support four
+pricing models on the bundle level (`price_unit` field on
+`tech_partner_bundles`):
 
 - `per_invocation` — 1 unit per `create`/`delete` call
 - `per_minute_runtime` — 1 unit per VM-minute (recommended for cloud providers)
 - `flat_monthly` — flat fee per active customer
 - `free` — open-source / loss-leader adapters
 
-Set pricing via the WebRobot dashboard:
-**Marketplace → Bundles → Set pricing**. Stripe Transfers are made
+When that ships you'll set pricing via the WebRobot dashboard:
+**Marketplace → Bundles → Set pricing**. Stripe Transfers will be made
 monthly to the bundle owner's Connect account based on
-`stage_usage_daily × pricing × revenue_share_percent`.
+`infrastructure_usage_daily × pricing × revenue_share_percent` —
+nothing for the partner to do beyond filling in the pricing fields.
 
 ## License
 
